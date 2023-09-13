@@ -1,0 +1,1101 @@
+USE [master]
+GO
+
+/****** Object:  StoredProcedure [dbo].[TruDBSecurity]    Script Date: 9/13/2023 3:15:29 PM ******/
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+CREATE proc [dbo].[TruDBSecurity]
+    @Debug              tinyint         = 1,
+    @DebugJSON          tinyint         = 0,
+    @DebugSQL           tinyint         = 0,
+    @FilterOnDB         sysname         = null,
+    @FilterOnLogin      sysname         = null,
+    @FilterOnRole       sysname         = null,
+    @Create             tinyint         = 0,
+    @Drop               tinyint         = 0,
+    @DeltasOnly         tinyint         = 1,
+    @ManagedOnly        tinyint         = 1,
+    @ExistingDBsOnly    tinyint         = 1,
+    @Execute            tinyint         = 0,
+    @ReturnIndJSON      tinyint         = 1,
+    @ReturnSingleJSON   tinyint         = 0,
+    @ReturnRecordset    tinyint         = 0,
+    @pathToMetadataJSON varchar(max)    = 'c:\DevOps\TruDBSecurity\config\All.Permissions.json', -- c:\DevOps\TruDBSecurity\All.Permissions.json
+    @env                varchar(max)    = 'Dev'                          -- DEV/TEST/PROD
+as
+begin
+    /*
+     _ Overview ___________________________________________________________________________________________________________________
+    |
+    |   1) Decompose "master" permissions from JSON metadata into table variables
+    |   2) Collect "current" server and database permissions from target server into table variables
+    |   3) Apply "ignore" filters (perms granted to public by default, etc.)
+    |   3) Generate statements to "create" missing permissions
+    |   4) Generate statements to "drop" extra permissions
+    |   5) Return individual JSON documents/single JSON document/recordset
+    |   6) Execute generated statements
+    |______________________________________________________________________________________________________________________________
+
+     _ Parameters _________________________________________________________________________________________________________________
+    |
+    |   @Debug              : Print debug messages
+    |   @DebugSQL           : Print dynamic sql
+    |   @FilterOnDB         : Constrain results to a specific database
+    |   @FilterOnLogin      : Constrain results to a specific login
+    |   @FilterOnRole       : Constrain results to a specific role (applies to both server and database roles)
+    |   @Create             : Include missing permissions in results
+    |   @Drop               : Include extra permissions in results
+    |   @DeltasOnly         : Constrain results to just differences between master json and target server
+    |   @ManagedOnly        : Constrain results to just server/database roles, databases, logins found in master json
+    |   @ExistingDBsOnly    : Constrain results to just databases that exist on the target server
+    |   @Execute            : Execute SQL commands to create or drop permissions
+    |   @ReturnIndJSON      : Return a resultset of individual json documents for each permission
+    |   @ReturnSingleJSON   : Return a resultset of a single json documents with all permissions
+    |   @ReturnRecordset    : Return a regular resultset of all permissions
+    |   @pathToMetadataJSON : Path to master json to override built-in master json in the sproc
+    |______________________________________________________________________________________________________________________________
+
+     _ Rules/Assumptions __________________________________________________________________________________________________________
+    |
+    |   To minimize complexity and simplify auditing:
+    |       a) System Logins should only be granted custom (Tru*) server roles and not be given server-level permissions and/or system roles directly
+    |       b) DB Users can only be granted custom (Tru*) database roles and not be given database-level permissions and/or system roles directly
+    |______________________________________________________________________________________________________________________________
+
+     _ Object Model _______________________________________________________________________________________________________________
+    |
+    |    PREFERRED (no permissiosn granted directly to SERVER LOGIN or DB USER)
+    |    ==========================================================================================================================
+    |
+    |    [SERVER LOGIN] ------------------------------> is member of --> [CUSTOM SERVER ROLE] ---> is member of --> [SERVER ROLE]
+    |                   \                                                                     \--> has          --> [SERVER PERMISSION]
+    |                    \--> maps to --> [DB USER] --> is member of --> [CUSTOM DB ROLE]     ---> is member of --> [DB ROLE]
+    |                                                                                         \--> has          --> [DB PERMISSION]
+    |
+    |    SUPPORTED
+    |    ==========================================================================================================================
+    |
+    |    [SERVER LOGIN] ------------------------------> is member of --> [CUSTOM SERVER ROLE] ---> is member of --> [SERVER ROLE]
+    |                  \                                                                      \--> has          --> [SERVER PERMISSION]
+    |                   \------------------------------------------------------------------------> has          --> [SERVER PERMISSION]
+    |                    \--> maps to --> [DB USER] --> is member of --> [CUSTOM DB ROLE] -------> is member of --> [DB ROLE]
+    |                                               \                                         \--> has          --> [DB PERMISSION]
+    |                                                \-------------------------------------------> has          --> [DB PERMISSION]
+    |______________________________________________________________________________________________________________________________
+            
+     _ Object Definition __________________________________________________________________________________________________________
+    |
+    |   [SERVER LOGIN]       = (preferred) should be MSAs (VETINSURANCE\[d|p]svc_<name>$)
+    |                          (optional) could be a SQL Account
+    |   [SERVER CUSTOM ROLE] = Tru* custom roles (eg. TruRO, TruRW)
+    |   [SERVER PERMISSION]  = server-level permissions (eg. connect sql, view server state)
+    |   [SERVER ROLE]        = built-in system-level role (eg. sysadmin)
+    |   [DB USER]            = 1:1 mapping between Server Login and Db User in each Db that login needs to access
+    |   [DB CUSTOM ROLE]     = Tru* custom roles (eg. TruRO, TruRW)
+    |   [DB PERMISSION]      = server-level permissions (eg. grant [insert|update|delete|select|execute] on SCHEMA::[dbo], grant VIEW DEFINITION)
+    |   [DB ROLE]            = built-in db-level role (eg. db_owner, DB_DATAREADER, db_datawriter)
+    |______________________________________________________________________________________________________________________________
+
+     _ Examples ___________________________________________________________________________________________________________________
+    |
+    |   Generate "audit" JSON documents (eg. for sending to Elastic)
+    |
+    |       exec dbo.TruDBSecurity
+    |
+    |   Generate and execute sql statements to create "master" permissions on the server and in each database.
+    |
+    |       exec dbo.TruDBSecurity @ReturnIndJSON = 0, @Create = 1, @Execute = 1
+    |
+    |   Generate but don't execute sql statements to drop permissions for "managed" logins/dbs on the server that are not described in "master" permissions.
+    |
+    |       exec dbo.TruDBSecurity @ReturnIndJSON = 0, @Drop = 1
+    |______________________________________________________________________________________________________________________________
+    */
+    set nocount on
+    declare @section sysname, @step sysname
+
+    -- If path to json is null or the octopus variable replacement has not happened, use this standard hardcoded path
+    if @pathToMetadataJSON is null or @pathToMetadataJSON like '#{Deploy%' select @pathToMetadataJSON = 'c:\DevOps\TruDBSecurity\All.Permissions.json'
+    if nullif( @env, '' ) is null  or @env                like '#{Deploy%' select @env                = 'PROD'
+
+    -- =================================
+    select @section = 'Initialize'; if @Debug > 0 print formatmessage( ': %s', @section )
+
+    select @step    = 'Parameters'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    if @Debug > 0
+    begin
+        print formatmessage( '  - %-20s : %d', '@Debug',               @Debug               )
+        print formatmessage( '  - %-20s : %d', '@DebugJSON',           @DebugJSON           )
+        print formatmessage( '  - %-20s : %d', '@DebugSQL',            @DebugSQL            )
+        print formatmessage( '  - %-20s : %s', '@FilterOnDB',          @FilterOnDB          )
+        print formatmessage( '  - %-20s : %s', '@FilterOnLogin',       @FilterOnLogin       )
+        print formatmessage( '  - %-20s : %s', '@FilterOnRole',        @FilterOnRole        )
+        print formatmessage( '  - %-20s : %d', '@Create',              @Create              )
+        print formatmessage( '  - %-20s : %d', '@Drop',                @Drop                )
+        print formatmessage( '  - %-20s : %d', '@DeltasOnly',          @DeltasOnly          )
+        print formatmessage( '  - %-20s : %d', '@ManagedOnly',         @ManagedOnly         )
+        print formatmessage( '  - %-20s : %d', '@ExistingDBsOnly',     @ExistingDBsOnly     )
+        print formatmessage( '  - %-20s : %d', '@Execute',             @Execute             )
+        print formatmessage( '  - %-20s : %d', '@ReturnIndJSON',       @ReturnIndJSON       )
+        print formatmessage( '  - %-20s : %d', '@ReturnSingleJSON',    @ReturnSingleJSON    )
+        print formatmessage( '  - %-20s : %d', '@ReturnRecordset',     @ReturnRecordset     )
+        print formatmessage( '  - %-20s : %s', '@pathToMetadataJSON',  @pathToMetadataJSON  )
+        print formatmessage( '  - %-20s : %s', '@env',                 @env                 )
+    end
+
+    select @step    = 'Variables'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    declare @managedLogins          table ( ignoreReason sysname null, [login] sysname, ord int identity(1,1) primary key clustered  )
+    declare @managedDBs             table ( ignoreReason sysname null, db sysname, ord int identity(1,1) primary key clustered )
+    declare @tgt_databases          table ( ignoreReason sysname null, db sysname, ord int identity(1,1) primary key clustered )
+    declare @tgt_svr_principals     table ( ignoreReason sysname null, name sysname, principal_id int, sid varbinary(85) null, type char(1), type_desc nvarchar(120) null, is_disabled bit null, create_date datetime, modify_date datetime, default_database_name sysname null, default_language_name sysname null, credential_id int null, owning_principal_id int null, is_fixed_role bit )
+    declare @tgt_svr_role_members   table ( ignoreReason sysname null, role_principal_id int, member_principal_id int )
+    declare @tgt_svr_permissions    table ( ignoreReason sysname null, class tinyint, class_desc nvarchar(120) null, major_id int, minor_id int, grantee_principal_id int, grantor_principal_id int, type char(4), permission_name nvarchar(256) null, state char(1), state_desc nvarchar(120) null, on_this sysname null )
+    declare @tgt_db_role_members    table ( ignoreReason sysname null, db sysname, role_principal_id int, member_principal_id int )
+    declare @tgt_db_principals      table ( ignoreReason sysname null, db sysname, name sysname, principal_id int, type char(1), type_desc nvarchar(120), default_schema_name sysname null, create_date datetime, modify_date datetime, owning_principal_id int, sid varbinary(85), is_fixed_role bit, authentication_type int, authentication_type_desc nvarchar(120), default_language_name sysname null, default_language_lcid int null, allow_encrypted_value_modifications bit )
+    declare @tgt_db_permissions     table ( ignoreReason sysname null, db sysname, class tinyint, class_desc nvarchar(120), major_id int, minor_id int, grantee_principal_id int, grantor_principal_id int, type char(4), permission_name nvarchar(256), state char(1), state_desc nvarchar(120), on_this sysname null )
+    declare @tgt_db_sysusers        table ( ignoreReason sysname null, db sysname, sid varbinary(85), name sysname )
+    declare @all_svr_role_perms     table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), svrrole sysname, [action] sysname, perm sysname null, [on] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_svr_role_roles     table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), svrrole sysname, [role] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_svr_login_perms    table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), [login] sysname, [action] sysname, perm sysname null, [on] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_svr_login_roles    table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), [login] sysname, [role] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_svr_logins         table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), [login] sysname, ordinal int identity(1,1) primary key clustered )
+    declare @all_db_role_perms      table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), db sysname, dbrole sysname, [action] sysname, perm sysname null, [on] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_db_role_roles      table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), db sysname, dbrole sysname, [role] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_db_user_perms      table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), db sysname, [user] sysname, [action] sysname, perm sysname null, [on] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_db_user_roles      table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), db sysname, [user] sysname, [role] sysname null, ordinal int identity(1,1) primary key clustered )
+    declare @all_db_users           table ( ignoreReason sysname null, isMaster tinyint default(0), isServer tinyint default(0), db sysname, [user] sysname, ordinal int identity(1,1) primary key clustered )
+    declare @sqlstmts               table ( section sysname, sqlstmt nvarchar(max), ordinal int identity(1,1) primary key clustered )
+
+    -- =================================
+    if @pathToMetadataJSON is not null
+    begin
+        select @section = 'Load master permissions JSON metadata from JSON file'; if @Debug > 0 print formatmessage( ': %s', @section )
+        declare @sql nvarchar(max) = replace( 'select @iMetadata = bulkcolumn from openrowset (bulk ''{pathToMetadataJSON}'', single_clob) as j', '{pathToMetadataJSON}', @pathToMetadataJSON )
+        declare @metadata nvarchar(max) = null
+        begin try
+            select @step    = 'Attempting to load ''master'' permissions from json file'; if @Debug > 0 print formatmessage( '  - %s', @step )
+            exec sp_executesql @sql, N'@iMetadata nvarchar(max) output', @iMetadata = @metadata output
+        end try
+        begin catch
+            select @step    = 'Error loading ''master'' permissions from json file, using built-in json'; if @Debug > 0 print formatmessage( '  - %s', @step )
+            select @metadata = null
+        end catch
+    end
+    if @metadata is null select @metadata = '{{INJECT_BUILTIN_JSON_HERE}}'
+    begin try
+        if @metadata like '%INJECT_BUILTIN_JSON_HERE%'
+            raiserror( 'Unable to parse ''master'' permissions from json (unable to load JSON file and no built-in JSON)', 16, 1 ) with nowait
+        if not exists( select 1 from openjson( @metadata ) with ( svrroles nvarchar(max) '$.svrroles' as json, dbs nvarchar(max) '$.dbs' as json, logins nvarchar(max) '$.logins' as json ) meta where coalesce( meta.svrroles, meta.dbs, meta.logins ) is not null )
+            raiserror( 'Unable to parse ''master'' permissions from json (contains no JSON or JSON is invalid)', 16, 1 ) with nowait
+    end try
+    begin catch
+        declare @msg varchar(max) = error_message()
+        raiserror( @msg, 16, 1 ) with nowait
+
+        if @DebugJSON > 0
+        begin
+            declare @line int = 0
+            declare @lines table ( [value] nvarchar(max), line int identity(1,1) )
+            insert into @lines( [value] ) select [value] from string_split( replace( @metadata, char(13), '' ), char(10) )
+            print formatmessage( '%s', stuff( replicate( '=', 158 ), 66, 27, ' ''Master'' permissions JSON ' ) )
+            print formatmessage( '%5s : %s', 'line', 'value' )
+            print formatmessage( '%5s : %s', '-----', replicate( '-', 150 ) )
+            while exists ( select 1 from @lines where line > @line )
+            begin
+                select top 1 @line = line, @msg = formatmessage( '%5d : %s', line, [value] ) from @lines where line > @line order by line
+                print @msg
+            end
+            print formatmessage( '%s', replicate( '=', 158 ) )
+        end
+        return
+    end catch
+
+    -- =================================
+    select @section = 'Get lists of managed logins/dbs from JSON metadata'; if @Debug > 0 print formatmessage( ': %s', @section )
+
+    select @step    = 'Get list of ''managed'' logins'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @managedLogins ( [login] )
+        --output inserted.*
+        select envs.[login]
+            from openjson( @metadata ) with ( logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            where envs.env = @env
+            order by 1
+
+    select @step    = 'Get list of ''managed'' databases'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @managedDBs ( db )
+        --output inserted.*
+        select dbs.db
+            from openjson( @metadata ) with ( dbs nvarchar(max) '$.dbs' as json ) meta
+            cross apply openjson( meta.dbs ) with ( db sysname '$.db' ) dbs
+            order by 1
+
+    select @step    = 'Ignore ''managed'' databases that do not exists on this server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update m set m.ignoreReason = isnull( m.ignoreReason, @step )
+        --output inserted.*
+        from @managedDBs m left join sys.databases d on m.db = d.[name]
+        where d.[name] is null and @ExistingDBsOnly > 0
+
+    -- =================================
+    select @section = 'Load master permission table variables from JSON metadata'; if @Debug > 0 print formatmessage( ': %s', @section )
+    
+    select @step    = 'Load svr role - svr perms from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_svr_role_perms ( isMaster, svrrole, [action], perm, [on] )
+        --output inserted.*
+        select 1, svrroles.svrrole, perms.[action], perms.perm, perms.[on]
+            from openjson( @metadata ) with ( svrroles nvarchar(max) '$.svrroles' as json ) meta
+            cross apply openjson( meta.svrroles ) with ( svrrole sysname '$.svrrole', perms nvarchar(max) '$.perms' as json ) svrroles
+            cross apply openjson( svrroles.perms ) with ( [action] sysname '$.action', perm sysname '$.perm', [on] sysname '$.on' ) perms
+            where nullif( perms.[action], '' ) is not null and nullif( perms.perm, '' ) is not null
+            order by 1, 2, 3, 4, 5
+
+    select @step    = 'Load svr role - svr roles from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_svr_role_roles ( isMaster, svrrole, [role] )
+        --output inserted.*
+        select 1, svrroles.svrrole, roles.[role]
+            from openjson( @metadata ) with ( svrroles nvarchar(max) '$.svrroles' as json ) meta
+            cross apply openjson( meta.svrroles ) with ( svrrole sysname '$.svrrole', roles nvarchar(max) '$.roles' as json ) svrroles
+            cross apply openjson( svrroles.roles ) with ( [role] sysname '$' ) roles
+            where nullif( roles.[role], '' ) is not null
+            order by 1, 2, 3
+
+    select @step    = 'Load svr login - svr perms from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_svr_login_perms ( isMaster, [login], [action], perm, [on] )
+        --output inserted.*
+        select 1, envs.[login], svrperms.[action], svrperms.perm, svrperms.[on]
+            from openjson( @metadata ) with ( logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json, svrperms nvarchar(max) '$.svrperms' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            cross apply openjson( logins.svrperms ) with ( [action] sysname '$.action', perm sysname '$.perm', [on] sysname '$.on' ) svrperms
+            where nullif( svrperms.[action], '' ) is not null and nullif( svrperms.perm, '' ) is not null
+            and envs.env = @env
+            order by 1, 2, 3, 4, 5
+
+    select @step    = 'Load svr login - svr roles from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_svr_login_roles ( isMaster, [login], [role] )
+        --output inserted.*
+        select 1, envs.[login], svrroles.[role]
+            from openjson( @metadata ) with ( logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json, svrroles nvarchar(max) '$.svrroles' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            cross apply openjson( logins.svrroles ) with ( [role] sysname '$' ) svrroles
+            where nullif( svrroles.[role], '' ) is not null
+            and envs.env = @env
+            order by 1, 2, 3
+
+    select @step    = 'Load svr logins from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_svr_logins ( isMaster, [login] )
+        --output inserted.*
+        select 1, envs.[login]
+            from openjson( @metadata ) with ( logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json, svrroles nvarchar(max) '$.svrroles' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            where envs.env = @env
+            order by 1, 2
+
+    select @step    = 'Load db role - db perms from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_db_role_perms ( isMaster, db, dbrole, [action], perm, [on] )
+        --output inserted.*
+        select 1, dbs.db, dbroles.dbrole, perms.[action], perms.perm, perms.[on]
+            from openjson( @metadata ) with ( dbs nvarchar(max) '$.dbs' as json ) meta
+            cross apply openjson( meta.dbs ) with ( db sysname '$.db', dbroles nvarchar(max) '$.dbroles' as json ) dbs
+            cross apply openjson( dbs.dbroles ) with ( dbrole sysname '$.dbrole', perms nvarchar(max) '$.perms' as json ) dbroles
+            cross apply openjson( dbroles.perms ) with ( [action] sysname '$.action', perm sysname '$.perm', [on] sysname '$.on' ) perms
+            where nullif( perms.[action], '' ) is not null and nullif( perms.perm, '' ) is not null
+            order by 1, 2, 3, 4, 5, 6
+
+    select @step    = 'Load db role - db roles from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_db_role_roles ( isMaster, db, dbrole, [role] )
+        --output inserted.*
+        select 1, dbs.db, dbroles.dbrole, roles.[role]
+            from openjson( @metadata ) with ( dbs nvarchar(max) '$.dbs' as json ) meta
+            cross apply openjson( meta.dbs ) with ( db sysname '$.db', dbroles nvarchar(max) '$.dbroles' as json ) dbs
+            cross apply openjson( dbs.dbroles ) with ( dbrole sysname '$.dbrole', roles nvarchar(max) '$.roles' as json ) dbroles
+            cross apply openjson( dbroles.roles ) with ( [role] sysname '$' ) roles
+            where nullif( roles.[role], '' ) is not null
+            order by 1, 2, 3, 4
+
+    select @step    = 'Load db user - db perms from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_db_user_perms ( isMaster, db, [user], [action], perm, [on] )
+        --output inserted.*
+        select 1, dbs.db, envs.[login], perms.[action], perms.perm, perms.[on]
+            from openjson( @metadata ) with ( dbs nvarchar(max) '$.dbs' as json, logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json, dbs nvarchar(max) '$.dbs' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            cross apply openjson( logins.dbs ) with ( db sysname '$.db', perms nvarchar(max) '$.perms' as json ) dbs
+            cross apply openjson( dbs.perms ) with ( [action] sysname '$.action', perm sysname '$.perm', [on] sysname '$.on' ) perms
+            where nullif( perms.[action], '' ) is not null and nullif( perms.perm, '' ) is not null
+            and envs.env = @env
+            order by 1, 2, 3, 4
+
+    select @step    = 'Load db user - db roles from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_db_user_roles ( isMaster, db, [user], [role] )
+        --output inserted.*
+        select 1, dbs.db, envs.[login], roles.[role]
+            from openjson( @metadata ) with ( dbs nvarchar(max) '$.dbs' as json, logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json, dbs nvarchar(max) '$.dbs' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            cross apply openjson( logins.dbs ) with ( db sysname '$.db', roles nvarchar(max) '$.roles' as json ) dbs
+            cross apply openjson( dbs.roles ) with ( [role] sysname '$' ) roles
+            where nullif( roles.[role], '' ) is not null
+            and envs.env = @env
+            order by 1, 2, 3, 4
+
+    select @step    = 'Load db users from metadata'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @all_db_users ( isMaster, db, [user] )
+        --output inserted.*
+        select 1, dbs.db, envs.[login]
+            from openjson( @metadata ) with ( dbs nvarchar(max) '$.dbs' as json, logins nvarchar(max) '$.logins' as json ) meta
+            cross apply openjson( meta.logins ) with ( envs nvarchar(max) '$.envs' as json, dbs nvarchar(max) '$.dbs' as json ) logins
+            cross apply openjson( logins.envs ) with ( env sysname '$.env', [login] sysname '$.login' ) envs
+            cross apply openjson( logins.dbs ) with ( db sysname '$.db', roles nvarchar(max) '$.roles' as json ) dbs
+            where envs.env = @env
+            order by 1, 2, 3
+
+    -- =================================
+    select @section = 'Load permission table variables from ''target'' server'; if @Debug > 0 print formatmessage( ': %s', @section )
+
+    select @step    = 'Get system table info from ''target'' server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @tgt_svr_principals ( [name], principal_id, [sid], [type], [type_desc], is_disabled, create_date, modify_date, default_database_name, default_language_name, credential_id, owning_principal_id, is_fixed_role )
+        --output inserted.*
+        select p.[name], p.principal_id, p.[sid], p.[type], p.[type_desc], p.is_disabled, p.create_date, p.modify_date, p.default_database_name, p.default_language_name, p.credential_id, p.owning_principal_id, p.is_fixed_role from sys.server_principals p (nolock)
+
+    insert into @tgt_svr_role_members ( role_principal_id, member_principal_id )
+        --output inserted.*
+        select rm.role_principal_id, rm.member_principal_id from sys.server_role_members rm (nolock)
+
+    insert into @tgt_svr_permissions ( class, class_desc, major_id, minor_id, grantee_principal_id, grantor_principal_id, [type], [permission_name], [state], state_desc, on_this )
+        --output inserted.*
+        select p.class, p.class_desc, p.major_id, p.minor_id, p.grantee_principal_id, p.grantor_principal_id, p.[type], p.permission_name, p.state, p.state_desc,
+            case
+                when p.class = 101 /* SERVER-PRINCIPAL */ then case sp.[type] when 'R' then 'SERVER ROLE::' else 'LOGIN::' end + quotename( sp.[name] )
+                when p.class = 105 /* ENDPOINT         */ then 'ENDPOINT::' + quotename( e.[name] )
+                end
+            from sys.server_permissions p (nolock)
+            left join sys.server_principals sp (nolock) on p.major_id = sp.principal_id and p.class = 101
+            left join sys.endpoints e (nolock) on p.major_id = e.endpoint_id and p.class = 105
+
+    select @step    = 'Get list of databases on ''target'' server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    insert into @tgt_databases ( db ) select d.name from sys.databases d
+
+    select @step    = 'Ignore database on ''target'' server that are not ''managed'''; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update t set t.ignoreReason = isnull( t.ignoreReason, @step ) from @tgt_databases t left join @managedDBs m on t.db = m.db where m.db is null and @ManagedOnly = 1
+
+    select @step    = 'Get system table info from each db on ''target'' server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    declare @ord int = 0, @dbname sysname
+    while exists( select 1 from @tgt_databases d where d.ignoreReason is null and d.ord > @ord )
+    begin
+        select top 1 @ord = d.ord, @dbname = d.db from @tgt_databases d where d.ignoreReason is null and d.ord > @ord order by d.ord
+        if @Debug > 0 print formatmessage( '  - %-20s : %s', '@dbname',  @dbname )
+
+        select @sql = replace( 'use [{dbname}]; select db=''{dbname}'', rm.role_principal_id, rm.member_principal_id from sys.database_role_members rm (nolock)', '{dbname}', @dbname )
+        if @DebugSQL > 0 print formatmessage(  '      executing : %s', @sql )
+        insert into @tgt_db_role_members ( db, role_principal_id, member_principal_id ) exec (@sql)
+
+        select @sql = replace( 'use [{dbname}]; select db=''{dbname}'', p.[name], p.principal_id, p.[type], p.[type_desc], p.default_schema_name, p.create_date, p.modify_date, p.owning_principal_id, p.[sid], p.is_fixed_role, p.authentication_type, p.authentication_type_desc, p.default_language_name, p.default_language_lcid, p.[allow_encrypted_value_modifications] from sys.database_principals p (nolock)', '{dbname}', @dbname )
+        if @DebugSQL > 0 print formatmessage(  '      executing : %s', @sql )
+        insert into @tgt_db_principals ( db, [name], principal_id, [type], [type_desc], default_schema_name, create_date, modify_date, owning_principal_id, [sid], is_fixed_role, authentication_type, authentication_type_desc, default_language_name, default_language_lcid, [allow_encrypted_value_modifications] ) exec (@sql)
+
+        select @sql = replace( 'use [{dbname}]; select db=''{dbname}'', p.class, p.class_desc, p.major_id, p.minor_id, p.grantee_principal_id, p.grantor_principal_id, p.[type], p.[permission_name], p.[state], p.state_desc, case
+                    when p.class = 1 and p.minor_id = 0  /* OBJECT   */ then ''OBJECT::''   + quotename( object_schema_name( p.major_id ) ) + ''.'' + quotename( object_name( p.major_id ) )
+                    when p.class = 1 and p.minor_id <> 0 /* COLUMN   */ then ''OBJECT::''   + quotename( object_schema_name( p.major_id ) ) + ''.'' + quotename( object_name( p.major_id ) ) + ''('' + quotename( col_name( p.major_id, p.minor_id ) ) + '')''
+                    when p.class = 3                     /* SCHEMA   */ then ''SCHEMA::''   + quotename( schema_name( p.major_id ) )
+                    when p.class = 4                     /* USER     */ then ''USER::''     + quotename( user_name( p.major_id ) )
+                    when p.class = 6                     /* TYPE     */ then ''TYPE::''     + ( select quotename( schema_name( t.schema_id ) ) + ''.'' + quotename( t.name ) from sys.types t where p.major_id = t.user_type_id )
+                    when p.class = 16                    /* CONTRACT */ then ''CONTRACT::'' + ( select quotename( s.name collate database_default ) from sys.service_contracts s where p.major_id = s.service_contract_id )
+                    when p.class = 17 and p.minor_id = 0 /* SERVICE  */ then ''SERVICE::''  + ( select quotename( s.name collate database_default ) from sys.services s where p.major_id = s.service_id )
+                    end
+                from sys.database_permissions p (nolock)', '{dbname}', @dbname )
+        if @DebugSQL > 0 print formatmessage(  '      executing : %s', @sql )
+        insert into @tgt_db_permissions ( db, class, class_desc, major_id, minor_id, grantee_principal_id, grantor_principal_id, [type], [permission_name], [state], state_desc, on_this ) exec (@sql)
+
+        select @sql = replace( 'use [{dbname}]; select db=''{dbname}'', [sid], name from sys.sysusers (nolock)', '{dbname}', @dbname )
+        if @DebugSQL > 0 print formatmessage(  '      executing : %s', @sql )
+        insert into @tgt_db_sysusers ( db, [sid], [name] ) exec (@sql)
+    end
+
+    select @step    = 'Load svr role - svr perms from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_svr_role_perms t
+        using (
+            select svrrole = r.[name], [action] = p.state_desc, perm = p.[permission_name], [on] = p.on_this from @tgt_svr_principals r join @tgt_svr_permissions p on r.principal_id = p.grantee_principal_id where r.[type] = 'R'
+            ) s on t.svrrole = s.svrrole and isnull( t.[action], '~~NULL~~' ) = isnull( s.[action], '~~NULL~~' ) and isnull( t.perm, '~~NULL~~' ) = isnull( s.perm, '~~NULL~~' ) and isnull( t.[on], '~~NULL~~' ) = isnull( s.[on], '~~NULL~~' )
+        when not matched by target then insert ( isServer, svrrole, [action], perm, [on] ) values ( 1, s.svrrole, s.[action], s.perm, s.[on] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load svr role - svr roles from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_svr_role_roles t
+        using (
+            select svrrole = m.[name], [role] = r.[name] from @tgt_svr_principals r join @tgt_svr_role_members rm on r.principal_id = rm.role_principal_id join @tgt_svr_principals m on rm.member_principal_id = m.principal_id where r.[type] = 'R' and m.[type] = 'R'
+            ) s on t.svrrole = s.svrrole and isnull( t.[role], '~~NULL~~' ) = isnull( s.[role], '~~NULL~~' )
+        when not matched by target then insert ( isServer, svrrole, [role] ) values ( 1, s.svrrole, s.[role] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load svr login - svr perms from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_svr_login_perms t
+        using (
+            select [login] = l.[name], [action] = p.state_desc, perm = p.[permission_name], [on] = p.on_this from @tgt_svr_principals l join @tgt_svr_permissions p on l.principal_id = p.grantee_principal_id where l.[type] in ( 'S', 'U', 'G' )
+            ) s on t.[login] = s.[login] and isnull( t.[action], '~~NULL~~' ) = isnull( s.[action], '~~NULL~~' ) and isnull( t.perm, '~~NULL~~' ) = isnull( s.perm, '~~NULL~~' ) and isnull( t.[on], '~~NULL~~' ) = isnull( s.[on], '~~NULL~~' )
+        when not matched by target then insert ( isServer, [login], [action], perm, [on] ) values ( 1, s.[login], s.[action], s.perm, s.[on] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load svr login - svr roles from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_svr_login_roles t
+        using (
+            select [login] = l.[name], [role] = r.[name] from @tgt_svr_principals l join @tgt_svr_role_members rm on l.principal_id = rm.member_principal_id join @tgt_svr_principals r on rm.role_principal_id = r.principal_id where l.[type] in ( 'S', 'U', 'G' ) and r.[type] = 'R'
+            ) s on t.[login] = s.[login] and isnull( t.[role], '~~NULL~~' ) = isnull( s.[role], '~~NULL~~' )
+        when not matched by target then insert ( isServer, [login], [role] ) values ( 1, s.[login], s.[role] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load svr logins from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_svr_logins t
+        using (
+            select [login] = l.[name] from @tgt_svr_principals l where l.[type] in ( 'S', 'U', 'G' )
+            ) s on t.[login] = s.[login]
+        when not matched by target then insert ( isServer, [login] ) values ( 1, s.[login] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load db role - db perms from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_db_role_perms t
+        using (
+            select r.db, dbrole = r.[name], [action] = p.state_desc, perm = p.[permission_name], [on] = p.on_this from @tgt_db_principals r join @tgt_db_permissions p on r.db = p.db and r.principal_id = p.grantee_principal_id where r.[type] = 'R'
+            ) s on t.db = s.db and t.dbrole = s.dbrole and isnull( t.[action], '~~NULL~~' ) = isnull( s.[action], '~~NULL~~' ) and isnull( t.perm, '~~NULL~~' ) = isnull( s.perm, '~~NULL~~' ) and isnull( t.[on], '~~NULL~~' ) = isnull( s.[on], '~~NULL~~' )
+        when not matched by target then insert ( isServer, db, dbrole, [action], perm, [on] ) values ( 1, s.db, s.dbrole, s.[action], s.perm, s.[on] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load db role - db roles from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_db_role_roles t
+        using (
+            select r.db, dbrole = m.[name], [role] = r.[name] from @tgt_db_principals r join @tgt_db_role_members rm on r.db = rm.db and r.principal_id = rm.role_principal_id join @tgt_db_principals m on rm.db = m.db and rm.member_principal_id = m.principal_id where r.[type] = 'R' and m.[type] = 'R'
+            ) s on t.db = s.db and t.dbrole = s.dbrole and isnull( t.[role], '~~NULL~~' ) = isnull( s.[role], '~~NULL~~' )
+        when not matched by target then insert ( isServer, db, dbrole, [role] ) values ( 1, s.db, s.dbrole, s.[role] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load db user - db perms from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_db_user_perms t
+        using (
+            select u.db, [login] = u.[name], [action] = p.state_desc, perm = p.[permission_name], [on] = p.on_this
+                from @tgt_db_principals u
+                join @tgt_db_permissions p on u.db = p.db and u.principal_id = p.grantee_principal_id
+                where u.[type] in ( 'S', 'U', 'G' )
+            ) s on t.db = s.db and t.[user] = s.[login] and isnull( t.[action], '~~NULL~~' ) = isnull( s.[action], '~~NULL~~' ) and isnull( t.perm, '~~NULL~~' ) = isnull( s.perm, '~~NULL~~' ) and isnull( t.[on], '~~NULL~~' ) = isnull( s.[on], '~~NULL~~' )
+        when not matched by target then insert ( isServer, db, [user], [action], perm, [on] ) values ( 1, s.db, s.[login], s.[action], s.perm, s.[on] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load db user - db roles from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_db_user_roles t
+        using (
+            select u.db, [login] = u.[name], [role] = r.[name]
+                from @tgt_db_principals u
+                join @tgt_db_role_members rm on u.db = rm.db and u.principal_id = rm.member_principal_id
+                join @tgt_db_principals r on rm.db = r.db and rm.role_principal_id = r.principal_id
+                where u.[type] in ( 'S', 'U', 'G' ) and r.[type] = 'R'
+            ) s on t.db = s.db and t.[user] = s.[login] and isnull( t.[role], '~~NULL~~' ) = isnull( s.[role], '~~NULL~~' )
+        when not matched by target then insert ( isServer, db, [user], [role] ) values ( 1, s.db, s.[login], s.[role] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    select @step    = 'Load db users from server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    merge @all_db_users t
+        using (
+            select u.db, [login] = u.[name]
+                from @tgt_db_principals u
+                where u.[type] in ( 'S', 'U', 'G' )
+            ) s on t.db = s.db and t.[user] = s.[login]
+        when not matched by target then insert ( isServer, db, [user] ) values ( 1, s.db, s.[login] )
+        when matched then update set isServer = 1
+        --output inserted.*
+        ;
+
+    -- =================================
+    select @section = 'Apply "ignore" rules to permission table variables'; if @Debug > 0 print formatmessage( ': %s', @section )
+
+    select @step    = 'Ignore logins that are ''built-in'''; if @Debug > 0 print formatmessage( '  - %s', @step )
+    declare @ignoreBuiltinLogins table ( [login] sysname )
+    insert into @ignoreBuiltinLogins ( [login] )
+        --output inserted.*
+        values
+        ( '##MS_AgentSigningCertificate##' ), ( '##MS_PolicyEventProcessingLogin##' ), ( '##MS_PolicySigningCertificate##' ), ( '##MS_PolicyTsqlExecutionLogin##' ), ( '##MS_SmoExtendedSigningCertificate##' ), ( '##MS_SQLAuthenticatorCertificate##' ), ( '##MS_SQLResourceSigningCertificate##' ), ( '##MS_SQLReplicationSigningCertificate##' ),
+        ( 'sa' ), ( 'BUILTIN\Administrators' ),
+        ( 'NT SERVICE\SQLWriter' ), ( 'NT SERVICE\Winmgmt' ), ( 'NT SERVICE\MSSQLSERVER' ), ( 'NT AUTHORITY\SYSTEM' ), ( 'NT SERVICE\SQLSERVERAGENT' ), ( 'NT SERVICE\SQLTELEMETRY' )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_login_perms a join @ignoreBuiltinLogins i on a.[login] = i.[login]
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_login_roles a join @ignoreBuiltinLogins i on a.[login] = i.[login]
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_logins      a join @ignoreBuiltinLogins i on a.[login] = i.[login]
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_perms   a join @ignoreBuiltinLogins i on a.[user] = i.[login]
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_roles   a join @ignoreBuiltinLogins i on a.[user] = i.[login]
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_users        a join @ignoreBuiltinLogins i on a.[user] = i.[login]
+
+    select @step    = 'Ignore logins that are not ''managed'''; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+         from @all_svr_login_perms a left join @managedLogins m on a.[login] = m.[login] where m.[login] is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+         from @all_svr_login_roles a left join @managedLogins m on a.[login] = m.[login] where m.[login] is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+         from @all_svr_logins      a left join @managedLogins m on a.[login] = m.[login] where m.[login] is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+         from @all_db_user_perms   a left join @managedLogins m on a.[user]  = m.[login] where m.[login] is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+         from @all_db_user_roles   a left join @managedLogins m on a.[user]  = m.[login] where m.[login] is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+         from @all_db_users        a left join @managedLogins m on a.[user]  = m.[login] where m.[login] is null and @ManagedOnly > 0
+
+    select @step    = 'Ignore databases that are not ''managed'''; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms a left join @managedDBs m on a.db = m.db where m.db is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_roles a left join @managedDBs m on a.db = m.db where m.db is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_perms a left join @managedDBs m on a.db = m.db where m.db is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_roles a left join @managedDBs m on a.db = m.db where m.db is null and @ManagedOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_users      a left join @managedDBs m on a.db = m.db where m.db is null and @ManagedOnly > 0
+
+    select @step    = 'Ignore databases that are not on the server'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms a left join sys.databases d on a.db = d.[name] where d.[name] is null
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_roles a left join sys.databases d on a.db = d.[name] where d.[name] is null
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_perms a left join sys.databases d on a.db = d.[name] where d.[name] is null
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_roles a left join sys.databases d on a.db = d.[name] where d.[name] is null
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_users      a left join sys.databases d on a.db = d.[name] where d.[name] is null
+
+    select @step    = 'Ignore perms that are automatically granted to public'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_role_perms a where a.svrrole = 'public' and a.[action] = 'grant' and ( a.perm in ( 'CONNECT SQL', 'VIEW ANY DATABASE' ) or ( a.perm = 'CONNECT' and a.[on] in ( 'ENDPOINT::[TSQL Default TCP]', 'ENDPOINT::[TSQL Default VIA]', 'ENDPOINT::[TSQL Local Machine]', 'ENDPOINT::[TSQL Named Pipes]' ) ) )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm = 'select' and a.[on] like ( 'OBJECT::[[]sys].%' ) -- public automatically granted SELECT on system views in every database
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm = 'select' and a.[on] like ( 'OBJECT::[[]dbo].%' ) -- public automatically granted SELECT on system views in every database
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm = 'select' and a.[on] like ( 'OBJECT::[[]INFORMATION_SCHEMA].%' ) -- public automatically granted SELECT on system views in every database
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm in ( 'VIEW ANY COLUMN ENCRYPTION KEY DEFINITION', 'VIEW ANY COLUMN MASTER KEY DEFINITION' ) -- public automatically granted VIEW ANY COLUMN ENCRYPTION/MASTER KEY DEFINITION on system views in every database
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm = 'execute' and a.[on] like ( 'OBJECT::[[]sys].%' ) and a.db = 'master' -- public automatically granted EXEC on system sprocs in master
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm = 'execute' and a.[on] like ( 'OBJECT::[[]sys].%' ) and a.db = 'master' -- public automatically granted EXEC on system sprocs in master
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms  a where a.dbrole  = 'public' and a.[action] = 'grant' and a.perm = 'execute' and a.[on] like ( 'OBJECT::[[]dbo].%diagram%' ) -- public automatically granted EXEC on 'diagram' sprocs/funcs in every database
+
+    select @step    = 'Ignore perms that are automatically granted to sysadmin'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_role_perms a where a.svrrole = 'sysadmin'
+
+    select @step    = 'Ignore "aspnet" roles'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms a where a.dbrole like 'aspnet_%'
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_roles a where a.dbrole like 'aspnet_%' or a.role like 'aspnet_%'
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_roles a where a.role like 'aspnet_%'
+
+    select @step    = 'Ignore MS Replication roles'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms a where a.dbrole like 'MSReplPAL_%' or a.dbrole like 'MSTran_PAL_%'
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_roles a where a.dbrole like 'MSReplPAL_%' or a.dbrole like 'MSTran_PAL_%' or a.role like 'MSReplPAL_%' or a.role like 'MSTran_PAL_%'
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_roles a where a.role like 'MSReplPAL_%' or a.role like 'MSTran_PAL_%'
+
+    select @step    = 'Ignore CONNECT SQL perms on logins'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_login_perms a where a.perm = 'CONNECT SQL'
+
+    select @step    = 'Ignore CONNECT perms on users'; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_perms a where a.perm = 'CONNECT'
+
+    select @step    = 'Ignore if ''deltas-only'''; if @Debug > 0 print formatmessage( '  - %s', @step )
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_role_perms  a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_role_roles  a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_login_perms a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_login_roles a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_svr_logins      a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_perms   a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_role_roles   a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_perms   a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_user_roles   a where a.isMaster = a.isServer and @DeltasOnly > 0
+    update a set a.ignoreReason = isnull( a.ignoreReason, @step )
+        --output inserted.*
+        from @all_db_users        a where a.isMaster = a.isServer and @DeltasOnly > 0
+
+    -- =================================
+    select @section = 'Generate SQL statements to be run'; if @Debug > 0 print formatmessage( ': %s', @section )
+    declare @formatstring nvarchar(max), @maxdblen varchar(10) = '', @maxrolelen varchar(10) = '', @maxloginlen varchar(10) = ''
+    select @maxdblen       = '-' + ( select convert( varchar, 2 + max( len( db      ) ) ) from ( select db               from @all_db_role_perms   union select db               from @all_db_role_roles   union select db               from @all_db_user_perms union select db               from @all_db_user_roles ) u )
+    --select @maxrolelen     = '-' + ( select convert( varchar, 2 + max( len( [role]  ) ) ) from ( select [role] = svrrole from @all_svr_role_perms  union select [role] = svrrole from @all_svr_role_roles  union select [role]  = dbrole from @all_db_role_perms union select [role]  = dbrole from @all_db_role_roles ) u )
+    --select @maxloginlen    = '-' + ( select convert( varchar, 2 + max( len( [login] ) ) ) from ( select [login]          from @all_svr_login_perms union select [login]          from @all_svr_login_roles union select [login] = [user] from @all_db_user_perms union select [login] = [user] from @all_db_user_roles ) u )
+    --select @maxdblen, @maxrolelen, @maxloginlen
+
+    -- Creates in order (svr role, svr login, svr role-svr login, db role, db user, db role-db user, svr role-svr perm, svr login-svr perm, db role-db perm, db user-db perm)
+    if @Create > 0
+    begin
+        select @step    = 'Create svr role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.server_principals where type = ''R'' and name = %{maxrolelen}s ) create server role %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select distinct @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.svrrole, '''' ), quotename( a.svrrole ) )
+                from ( select ignoreReason, isMaster, isServer, svrrole from @all_svr_role_perms union select ignoreReason, isMaster, isServer, svrrole from @all_svr_role_roles ) a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.svrrole = isnull( @FilterOnRole, a.svrrole )
+                order by 1, 2
+
+        select @step    = 'Create svr role - svr perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), lower( a.[action] ), a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.svrrole ) )
+                from @all_svr_role_perms a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.svrrole = isnull( @FilterOnRole, a.svrrole )
+                order by 1, 2
+
+        select @step    = 'Create svr role - svr role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.server_principals r join sys.server_role_members rm on r.principal_id = rm.role_principal_id join sys.server_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter server role %{maxrolelen}s add member %{maxloginlen}s'; select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.[role], '''' ), quotename( a.svrrole, '''' ), quotename( a.[role] ), quotename( a.svrrole ) )
+                from @all_svr_role_roles a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.svrrole = isnull( @FilterOnRole, a.svrrole )
+                order by 1, 2
+
+        select @step    = 'Create db role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.database_principals where type = ''R'' and name = %{maxrolelen}s ) create role %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select distinct @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.dbrole, '''' ), quotename( a.dbrole ) )
+                from ( select ignoreReason, isMaster, isServer, db, dbrole from @all_db_role_perms union select ignoreReason, isMaster, isServer, db, dbrole from @all_db_role_roles ) a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.dbrole = isnull( @FilterOnRole, a.dbrole )
+                order by 1, 2
+
+        select @step    = 'Create db role - db perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), lower( a.[action] ), a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.dbrole ) )
+                from @all_db_role_perms a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.dbrole = isnull( @FilterOnRole, a.dbrole )
+                order by 1, 2
+
+        select @step    = 'Create db role - db role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.database_principals r join sys.database_role_members rm on r.principal_id = rm.role_principal_id join sys.database_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter role %{maxrolelen}s add member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.[role], '''' ), quotename( a.dbrole, '''' ), quotename( a.[role] ), quotename( a.dbrole ) )
+                from @all_db_role_roles a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.dbrole = isnull( @FilterOnRole, a.dbrole )
+                order by 1, 2
+
+        select @step    = 'Create svr login'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.server_principals where type <> ''R'' and name = %{maxloginlen}s ) create login %{maxloginlen}s %s; grant connect sql to %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select distinct @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.[login], '''' ), quotename( a.[login] ), iif( charindex( '\', a.[login] ) > 0, 'from windows     ', 'with password = ''B0o_ya1!''' ), quotename( a.[login] ) )
+                from ( select ignoreReason, isMaster, isServer, [login] from @all_svr_logins union select ignoreReason, isMaster, isServer, [login] = [user] from @all_db_users ) a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.[login] = isnull( @FilterOnLogin, a.[login] )
+                order by 1, 2
+
+        select @step    = 'Create svr login - svr perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), lower( a.[action] ), a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.[login] ) )
+                from @all_svr_login_perms a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.[login] = isnull( @FilterOnLogin, a.[login] )
+                order by 1, 2
+
+        select @step    = 'Create svr login - svr role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.server_principals r join sys.server_role_members rm on r.principal_id = rm.role_principal_id join sys.server_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter server role %{maxrolelen}s add member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.[role], '''' ), quotename( a.[login], '''' ), quotename( a.[role] ), quotename( a.[login] ) )
+                from @all_svr_login_roles a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.[login] = isnull( @FilterOnLogin, a.[login] ) and a.[role] = isnull( @FilterOnRole, a.[role] )
+                order by 1, 2
+
+        select @step    = 'Create db user'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.database_principals u where u.[type] in ( ''S'', ''U'', ''G'' ) and u.[name] = %{maxloginlen}s ) create user %{maxloginlen}s for login %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.[user], '''' ), quotename( a.[user] ), quotename( a.[user] ) )
+                from @all_db_users  a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.[user] = isnull( @FilterOnLogin, a.[user] )
+                order by 1, 2
+
+        select @step    = 'Create db user - perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), lower( a.[action] ), a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.[user] ) )
+                from @all_db_user_perms a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.[user] = isnull( @FilterOnLogin, a.[user] )
+                order by 1, 2
+
+        select @step    = 'Create db user - role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if not exists( select 1 from sys.database_principals r join sys.database_role_members rm on r.principal_id = rm.role_principal_id join sys.database_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter role %{maxrolelen}s add member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.[role], '''' ), quotename( a.[user], '''' ), quotename( a.[role] ), quotename( a.[user] ) )
+                from @all_db_user_roles a
+                where a.ignoreReason is null and a.isMaster = 1 and ( @DeltasOnly = 0 or a.isServer = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.[user] = isnull( @FilterOnLogin, a.[user] ) and a.[role] = isnull( @FilterOnRole, a.[role] )
+                order by 1, 2
+    end
+
+    -- Drops in reverse order (db user-db perm, db role-db perm, svr login-svr perm, svr role-svr perm, db role-db user, db user, db role, svr role-svr login, svr login, svr role)
+    if @Drop > 0
+    begin
+        select @step    = 'Drop db user - role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.database_principals r join sys.database_role_members rm on r.principal_id = rm.role_principal_id join sys.database_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter role %{maxrolelen}s drop member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.[role], '''' ), quotename( a.[user], '''' ), quotename( a.[role] ), quotename( a.[user] ) )
+                from @all_db_user_roles a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.[user] = isnull( @FilterOnLogin, a.[user] ) and a.[role] = isnull( @FilterOnRole, a.[role] )
+                order by 1, 2
+
+        select @step    = 'Drop db user - perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s /* %s */ %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), 'revoke', a.[action], a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.[user] ) )
+                from @all_db_user_perms a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.[user] = isnull( @FilterOnLogin, a.[user] )
+                order by 1, 2
+
+        select @step    = 'Drop db user'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.database_principals u where u.[type] in ( ''S'', ''U'', ''G'' ) and u.[name] = %{maxloginlen}s ) drop user %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.[user], '''' ), quotename( a.[user] ) )
+                from ( select ignoreReason = max( isnull( g.ignoreReason, '~~NULL~~' ) ), isMaster = max( g.isMaster ), isServer = max( g.isServer ), g.db, g.[user] from @all_db_users g group by g.db, g.[user] having max( g.isServer ) > 0 and max( g.isMaster ) > 0 ) a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.[user] = isnull( @FilterOnLogin, a.[user] )
+                order by 1, 2
+
+        select @step    = 'Drop svr login - svr role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.server_principals r join sys.server_role_members rm on r.principal_id = rm.role_principal_id join sys.server_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter server role %{maxrolelen}s drop member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.[role], '''' ), quotename( a.[login], '''' ), quotename( a.[role] ), quotename( a.[login] ) )
+                from @all_svr_login_roles a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.[login] = isnull( @FilterOnLogin, a.[login] ) and a.[role] = isnull( @FilterOnRole, a.[role] )
+                order by 1, 2
+
+        select @step    = 'Drop svr login - svr perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s /* %s */ %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), 'revoke', a.[action], a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.[login] ) )
+                from @all_svr_login_perms a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.[login] = isnull( @FilterOnLogin, a.[login] )
+                order by 1, 2
+
+        select @step    = 'Drop svr login'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.server_principals where type <> ''R'' and name = %{maxloginlen}s ) drop login %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select distinct @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.[login], '''' ), quotename( a.[login] ) )
+                from ( select ignoreReason = max( isnull( g.ignoreReason, '~~NULL~~' ) ), isMaster = max( g.isMaster ), isServer = max( g.isServer ), g.[login] from @all_svr_logins g  group by g.[login] having max( g.isServer ) > 0 and max( g.isMaster ) > 0 ) a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.[login] = isnull( @FilterOnLogin, a.[login] )
+                order by 1, 2
+
+        select @step    = 'Drop db role - db role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.database_principals r join sys.database_role_members rm on r.principal_id = rm.role_principal_id join sys.database_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter role %{maxrolelen}s drop member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.[role], '''' ), quotename( a.dbrole, '''' ), quotename( a.[role] ), quotename( a.dbrole ) )
+                from @all_db_role_roles a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.dbrole = isnull( @FilterOnRole, a.dbrole )
+                order by 1, 2
+
+        select @step    = 'Drop db role - db perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s /* %s */ %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), 'revoke', a.[action], a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.dbrole ) )
+                from @all_db_role_perms a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.dbrole = isnull( @FilterOnRole, a.dbrole )
+                order by 1, 2
+
+        select @step    = 'Drop db role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.database_principals where type = ''R'' and name = %{maxrolelen}s ) drop role %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select distinct @step, sqlstmt = formatmessage( @formatstring, quotename( a.db ), quotename( a.dbrole, '''' ), quotename( a.dbrole ) )
+                from ( select ignoreReason = max( isnull( g.ignoreReason, '~~NULL~~' ) ), isMaster = max( g.isMaster ), isServer = max( g.isServer ), g.db, g.dbrole from ( select ignoreReason, isMaster, isServer, db, dbrole from @all_db_role_perms union select ignoreReason, isMaster, isServer, db, dbrole from @all_db_role_roles ) g  group by g.db, g.dbrole having max( g.isServer ) > 0 and max( g.isMaster ) > 0 ) a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.db = isnull( @FilterOnDB, a.db ) and a.dbrole = isnull( @FilterOnRole, a.dbrole )
+                order by 1, 2
+
+        select @step    = 'Drop svr role - svr role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.server_principals r join sys.server_role_members rm on r.principal_id = rm.role_principal_id join sys.server_principals m on rm.member_principal_id = m.principal_id where r.[type] = ''R'' and r.[name] = %{maxrolelen}s and m.[name] = %{maxloginlen}s ) alter server role %{maxrolelen}s drop member %{maxloginlen}s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.[role], '''' ), quotename( a.svrrole, '''' ), quotename( a.[role] ), quotename( a.svrrole ) )
+                from @all_svr_role_roles a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.svrrole = isnull( @FilterOnRole, a.svrrole )
+                order by 1, 2
+
+        select @step    = 'Drop svr role - svr perm'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; %s /* %s */ %s %s%s %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), 'revoke', a.[action], a.perm, isnull( 'on ' + a.[on] + ' ', '' ), iif( a.[action] in ( 'grant', 'deny' ), 'to', 'from' ), quotename( a.svrrole ) )
+                from @all_svr_role_perms a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.svrrole = isnull( @FilterOnRole, a.svrrole )
+                order by 1, 2
+
+        select @step    = 'Drop svr role'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select @formatstring = 'use %{maxdblen}s; if exists( select 1 from sys.server_principals where type = ''R'' and name = %{maxrolelen}s ) drop server role %s'
+        select @formatstring = replace( replace( replace( @formatstring, '{maxdblen}', @maxdblen ), '{maxrolelen}', @maxrolelen ), '{maxloginlen}', @maxloginlen )
+        insert into @sqlstmts ( section, sqlstmt )
+            select distinct @step, sqlstmt = formatmessage( @formatstring, quotename( 'master' ), quotename( a.svrrole, '''' ), quotename( a.svrrole ) )
+                from ( select ignoreReason = max( isnull( g.ignoreReason, '~~NULL~~' ) ), isMaster = max( g.isMaster ), isServer = max( g.isServer ), g.svrrole from ( select ignoreReason, isMaster, isServer, svrrole from @all_svr_role_perms union select ignoreReason, isMaster, isServer, svrrole from @all_svr_role_roles ) g  group by g.svrrole having max( g.isServer ) > 0 and max( g.isMaster ) > 0 ) a
+                where a.ignoreReason is null and a.isServer = 1 and ( @DeltasOnly = 0 or a.isMaster = 0 ) and a.svrrole not in ( 'public' ) and a.svrrole = isnull( @FilterOnRole, a.svrrole )
+                order by 1, 2
+    end
+
+    -- =================================
+    select @section = 'Print/Execute SQL statements'; if @Debug > 0 print formatmessage( ': %s', @section )
+    declare @ordinal int = 0, @sqlstmt nvarchar(max)
+    while exists ( select 1 from @sqlstmts where ordinal > @ordinal )
+    begin
+        select top 1 @ordinal = ordinal, @section = section, @sqlstmt = formatmessage( '/* %-30s */ %s', section, sqlstmt ) from @sqlstmts where ordinal > @ordinal order by ordinal
+        if @Debug   > 0 print formatmessage( '  - %-20s : %s', '@sqlstmt',  @sqlstmt )
+        if @Execute > 0
+            begin try
+                exec( @sqlstmt )
+            end try
+            begin catch
+                select @msg = error_message()
+                print formatmessage( '    Warning : %s', @msg )
+            end catch
+    end
+
+    ---- =================================
+    select @section = 'Return JSON Audit data'; if @Debug > 0 print formatmessage( ': %s', @section )
+    --   NOTES:
+    --     TruHoarder sends each record separately to Elastic to be index as it's own document.
+    --     Sending smaller individual records as separate small documents, instead of a single resultset as one giant document, allows us to use UDP transport.
+
+    if @ReturnSingleJSON > 0
+    begin
+        select @step    = 'Return as Single JSON document'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        ;with
+            svrroles as (
+                select svrrole from (
+                    select svrrole from @all_svr_role_roles svrroles union
+                    select svrrole from @all_svr_role_perms
+                    ) u ),
+            dbs as (
+                select db from (
+                    select db from @all_db_role_roles union
+                    select db from @all_db_role_perms union
+                    select db from @all_db_user_roles union
+                    select db from @all_db_user_perms
+                    ) u ),
+            dbroles as (
+                select db, dbrole from (
+                    select db, dbrole from @all_db_role_roles union
+                    select db, dbrole from @all_db_role_perms
+                    ) u ),
+            logins as (
+                select [login] from (
+                    select [login]          from @all_svr_login_roles union
+                    select [login]          from @all_svr_login_perms union
+                    select [login] = [user] from @all_db_user_roles union
+                    select [login] = [user] from @all_db_user_perms
+                    ) u ),
+            logindbs as (
+                select [login], db from (
+                    select [login] = [user], db from @all_db_user_roles union
+                    select [login] = [user], db from @all_db_user_perms
+                    ) u )
+        select json_data = (
+            select
+                svrroles = (
+                    select
+                        svrroles.svrrole,
+                        roles = ( select roles.[role],                           roles.isMaster, roles.isServer, roles.ignoreReason from @all_svr_role_roles roles where svrroles.svrrole = roles.svrrole order by roles.ignoreReason, roles.isMaster desc, roles.isServer desc, roles.[role] for json auto ),
+                        perms = ( select perms.[action], perms.perm, perms.[on], perms.isMaster, perms.isServer, perms.ignoreReason from @all_svr_role_perms perms where svrroles.svrrole = perms.svrrole order by perms.ignoreReason, perms.isMaster desc, perms.isServer desc, perms.[action], perms.perm, perms.[on] for json auto )
+                        from svrroles
+                        where svrroles.svrrole = isnull( @FilterOnRole, svrroles.svrrole )                                                 
+                        order by svrroles.svrrole
+                        for json auto
+                    ),
+                dbs = (
+                    select
+                        dbs.db,
+                        dbroles = (
+                            select
+                                dbroles.dbrole,
+                                roles = ( select roles.[role],                           roles.isMaster, roles.isServer, roles.ignoreReason from @all_db_role_roles roles where dbroles.db = roles.db and dbroles.dbrole = roles.dbrole order by roles.ignoreReason, roles.isMaster desc, roles.isServer desc, roles.[role] for json auto ),
+                                perms = ( select perms.[action], perms.perm, perms.[on], perms.isMaster, perms.isServer, perms.ignoreReason from @all_db_role_perms perms where dbroles.db = perms.db and dbroles.dbrole = perms.dbrole order by perms.ignoreReason, perms.isMaster desc, perms.isServer desc, perms.[action], perms.perm, perms.[on] for json auto )
+                                from dbroles
+                                where dbroles.dbrole = isnull( @FilterOnRole, dbroles.dbrole )
+                                and dbs.db = dbroles.db
+                                order by dbrole
+                                for json auto
+                            )
+                        from dbs
+                        where dbs.db = isnull( @FilterOnDB, dbs.db )
+                        order by dbs.db
+                        for json auto
+                    ),
+                logins = (
+                    select
+                        envs     = ( select env = @env, [login] from ( select logins.[login] ) l for json auto ),
+                        svrroles = (
+                            select
+                                roles.[role], roles.isMaster, roles.isServer, roles.ignoreReason
+                                from @all_svr_login_roles roles
+                                where roles.[role] = isnull( @FilterOnRole, roles.[role] )
+                                and logins.[login] = roles.[login]
+                                order by roles.ignoreReason, roles.isMaster desc, roles.isServer desc, roles.[role]
+                                for json auto
+                            ),
+                        svrperms = (
+                            select
+                                perms.[action], perms.perm, perms.[on], perms.isMaster, perms.isServer, perms.ignoreReason
+                                from @all_svr_login_perms perms
+                                where logins.[login] = perms.[login]
+                                order by perms.ignoreReason, perms.isMaster desc, perms.isServer desc, perms.[action], perms.perm, perms.[on]
+                                for json auto
+                            ),
+                        dbs = (
+                            select
+                                logindbs.db,
+                                roles = ( select roles.[role],                           roles.isMaster, roles.isServer, roles.ignoreReason from @all_db_user_roles roles where logindbs.db = roles.db and logindbs.[login] = roles.[user] and roles.[role] = isnull( @FilterOnRole, roles.[role] ) order by roles.ignoreReason, roles.isMaster desc, roles.isServer desc, roles.[role] for json auto ),
+                                perms = ( select perms.[action], perms.perm, perms.[on], perms.isMaster, perms.isServer, perms.ignoreReason from @all_db_user_perms perms where logindbs.db = perms.db and logindbs.[login] = perms.[user] order by perms.ignoreReason, perms.isMaster desc, perms.isServer desc, perms.[action], perms.perm, perms.[on] for json auto )
+                                from logindbs
+                                where logins.[login] = logindbs.[login]
+                                and logindbs.db = isnull( @FilterOnDB, logindbs.db )
+                                order by logindbs.db
+                                for json auto
+                            )
+                        from logins
+                        where logins.[login] = isnull( @FilterOnLogin, logins.[login] )
+                        order by logins.[login]
+                        for json auto
+                    )
+                from ( select dummy = 1 ) d for json auto, without_array_wrapper
+            )
+        --select json_data = ( select svrroles.svrrole from svrroles ) for json auto, without_array_wrapper
+    end
+    if @ReturnIndJSON > 0
+    begin
+        select @step    = 'Return as Individual JSON documents'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        declare @dbtimestamp varchar(30) = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z'
+        declare @jsondocs table ( json_data nvarchar(max) )
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'Server Role Perms'  ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, svrrole,     [action], perm, [on] ) a for json auto, without_array_wrapper ) from @all_svr_role_perms  where ignoreReason is null and                                    svrrole = isnull( @FilterOnRole,  svrrole )                                                 order by isMaster desc, isServer desc, [svrrole], [action], perm, [on]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'Server Role Roles'  ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, svrrole,     [role]               ) a for json auto, without_array_wrapper ) from @all_svr_role_roles  where ignoreReason is null and                                    svrrole = isnull( @FilterOnRole,  svrrole )                                                 order by isMaster desc, isServer desc, [svrrole], [role]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'Server Login Perms' ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, [login],     [action], perm, [on] ) a for json auto, without_array_wrapper ) from @all_svr_login_perms where ignoreReason is null and                                                                                    [login] = isnull( @FilterOnLogin, [login] ) order by isMaster desc, isServer desc, [login], [action], perm, [on]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'Server Login Roles' ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, [login],     [role]               ) a for json auto, without_array_wrapper ) from @all_svr_login_roles where ignoreReason is null and                                    [role]  = isnull( @FilterOnRole,  [role]  ) and [login] = isnull( @FilterOnLogin, [login] ) order by isMaster desc, isServer desc, [login], [role]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'Server Logins'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, [login]                           ) a for json auto, without_array_wrapper ) from @all_svr_logins      where ignoreReason is null and                                                                                    [login] = isnull( @FilterOnLogin, [login] ) order by isMaster desc, isServer desc, [login]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'DB Role Perms'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, dbrole,  [action], perm, [on] ) a for json auto, without_array_wrapper ) from @all_db_role_perms   where ignoreReason is null and db = isnull( @FilterOnDb, db ) and dbrole  = isnull( @FilterOnRole,  dbrole  )                                                 order by isMaster desc, isServer desc, [dbrole], [action], perm, [on]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'DB Role Roles'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, dbrole,  [role]               ) a for json auto, without_array_wrapper ) from @all_db_role_roles   where ignoreReason is null and db = isnull( @FilterOnDb, db ) and dbrole  = isnull( @FilterOnRole,  dbrole  )                                                 order by isMaster desc, isServer desc, [dbrole], [role]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'DB User Perms'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, [user],  [action], perm, [on] ) a for json auto, without_array_wrapper ) from @all_db_user_perms   where ignoreReason is null and db = isnull( @FilterOnDb, db )                                                 and [user]  = isnull( @FilterOnLogin, [user]  ) order by isMaster desc, isServer desc, [user], [action], perm, [on]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'DB User Roles'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, [user],  [role]               ) a for json auto, without_array_wrapper ) from @all_db_user_roles   where ignoreReason is null and db = isnull( @FilterOnDb, db ) and [role]  = isnull( @FilterOnRole,  [role] )  and [user]  = isnull( @FilterOnLogin, [user]  ) order by isMaster desc, isServer desc, [user], [role]
+        insert into @jsondocs ( json_data ) select json_data = ( select dbtimestamp = replace( convert( varchar(max), sysutcdatetime(), 121 ), ' ', 'T' ) + 'Z', * from ( select [type] = convert( sysname, 'DB Users'           ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, [user]                        ) a for json auto, without_array_wrapper ) from @all_db_users        where ignoreReason is null and db = isnull( @FilterOnDb, db ) and                                                 [user]  = isnull( @FilterOnLogin, [user]  ) order by isMaster desc, isServer desc, [user]
+        select json_data from @jsondocs where json_data is not null
+    end
+    if @ReturnRecordset > 0
+    begin
+        select @step    = 'Return raw data'; if @Debug > 0 print formatmessage( '  - %s', @step )
+        select [table] = '@all_svr_role_perms',  [type] = convert( sysname, 'Server Role Perms'  ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, svrrole,     [action], perm, [on] from @all_svr_role_perms  where                                    svrrole = isnull( @FilterOnRole,  svrrole )                                                 order by isMaster desc, isServer desc, [svrrole], [action], perm, [on]
+        select [table] = '@all_svr_role_roles',  [type] = convert( sysname, 'Server Role Roles'  ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, svrrole,     [role]               from @all_svr_role_roles  where                                    svrrole = isnull( @FilterOnRole,  svrrole )                                                 order by isMaster desc, isServer desc, [svrrole], [role]
+        select [table] = '@all_svr_login_perms', [type] = convert( sysname, 'Server Login Perms' ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, [login],     [action], perm, [on] from @all_svr_login_perms where                                                                                    [login] = isnull( @FilterOnLogin, [login] ) order by isMaster desc, isServer desc, [login], [action], perm, [on]
+        select [table] = '@all_svr_login_roles', [type] = convert( sysname, 'Server Login Roles' ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, [login],     [role]               from @all_svr_login_roles where                                    [role]  = isnull( @FilterOnRole,  [role]  ) and [login] = isnull( @FilterOnLogin, [login] ) order by isMaster desc, isServer desc, [login], [role]
+        select [table] = '@all_svr_logins',      [type] = convert( sysname, 'Server Logins'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, [login]                           from @all_svr_logins      where                                                                                    [login] = isnull( @FilterOnLogin, [login] ) order by isMaster desc, isServer desc, [login]
+        select [table] = '@all_db_role_perms',   [type] = convert( sysname, 'DB Role Perms'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, dbrole,  [action], perm, [on] from @all_db_role_perms   where db = isnull( @FilterOnDb, db ) and dbrole  = isnull( @FilterOnRole,  dbrole  )                                                 order by isMaster desc, isServer desc, [dbrole], [action], perm, [on]
+        select [table] = '@all_db_role_roles',   [type] = convert( sysname, 'DB Role Roles'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, dbrole,  [role]               from @all_db_role_roles   where db = isnull( @FilterOnDb, db ) and dbrole  = isnull( @FilterOnRole,  dbrole  )                                                 order by isMaster desc, isServer desc, [dbrole], [role]
+        select [table] = '@all_db_user_perms',   [type] = convert( sysname, 'DB User Perms'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, [user],  [action], perm, [on] from @all_db_user_perms   where db = isnull( @FilterOnDb, db )                                                 and [user]  = isnull( @FilterOnLogin, [user]  ) order by isMaster desc, isServer desc, [user], [action], perm, [on]
+        select [table] = '@all_db_user_roles',   [type] = convert( sysname, 'DB User Roles'      ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, [user],  [role]               from @all_db_user_roles   where db = isnull( @FilterOnDb, db ) and [role]  = isnull( @FilterOnRole,  [role] )  and [user]  = isnull( @FilterOnLogin, [user]  ) order by isMaster desc, isServer desc, [user], [role]
+        select [table] = '@all_db_users',        [type] = convert( sysname, 'DB Users'           ), [status] = case when isMaster = 1 and isServer = 0 then 'missing' when isMaster = 0 and isServer = 1 then 'extra' else 'ok' end, ignoreReason, isMaster, isServer, db, [user]                        from @all_db_users        where db = isnull( @FilterOnDb, db ) and                                                 [user]  = isnull( @FilterOnLogin, [user]  ) order by isMaster desc, isServer desc, [user]
+    end
+end
+GO
